@@ -1,0 +1,449 @@
+# Idempotent Background Transaction Processing Service
+## Forward Deployed Engineer (FDE) Assessment Solution
+
+**Technology:** Java 21, Spring Boot, Spring Data JPA, H2, Maven
+
+**Solution positioning:** FDE L2-oriented implementation
+
+---
+
+# 1. Executive Summary
+
+This project implements an idempotent background transaction processing service designed to process financial transactions reliably despite duplicate requests, out-of-order delivery, concurrent execution and transient failures.
+
+The solution focuses on protecting business consistency rather than simply executing background jobs.
+
+The primary objectives are:
+
+- Prevent duplicate financial transactions.
+- Ensure account balances remain consistent.
+- Handle out-of-order transaction requests.
+- Support safe retry and failure recovery.
+- Maintain an auditable transaction ledger.
+- Provide operational visibility into processing status.
+
+The implementation uses a database-backed inbox, a background worker and transactional processing.
+
+The design follows an at-least-once processing model with idempotency and atomic database operations to achieve effectively-once business effects.
+
+# 2. Business Problem
+
+Enterprise systems frequently receive transactions from multiple upstream sources:
+
+- REST APIs.
+- Payment gateways.
+- Message queues.
+- Batch files.
+- Scheduled jobs.
+- External banking systems.
+
+These requests can be duplicated, delayed, reordered or retried.
+
+For example, a payment request may reach the service successfully, but the client may experience a network timeout before receiving the response.
+
+The client retries the request, potentially causing a duplicate debit unless the application implements idempotency.
+
+Similarly, transactions may arrive out of order, causing an incorrect account balance if processing follows arrival order instead of business sequence.
+
+The solution must protect financial consistency under these conditions.
+
+# 3. Assumptions and Business Rules
+
+1. Every transaction has a unique business transaction ID.
+2. Every submission has an idempotency key.
+3. An account has an associated currency.
+4. Transaction amounts must be positive.
+5. A debit cannot result in a negative account balance.
+6. Transactions belonging to an account are processed in sequence order.
+7. A transaction must not produce duplicate ledger entries.
+8. Technical failures can be retried.
+9. Permanent business failures should not be retried indefinitely.
+10. Account updates and ledger creation must be atomic.
+
+For this implementation, sequence numbers are assumed to be unique and contiguous per account. A production implementation must explicitly define how missing sequence numbers are reconciled.
+
+# 4. Solution Architecture
+
+```text
+          Upstream Systems
+                 |
+                 v
+          REST API Layer
+                 |
+                 v
+       Transaction Ingestion
+                 |
+                 v
+        Idempotency Validation
+                 |
+                 v
+          Transaction Inbox
+                 |
+                 v
+        Background Worker
+                 |
+                 v
+       Transaction Processor
+                 |
+          +------+------+
+          |             |
+          v             v
+     Account Table   Ledger Table
+          |             |
+          +------+------+
+                 |
+                 v
+         Atomic DB Commit
+```
+
+## Component responsibilities
+
+### REST Controller
+
+- Accepts transaction requests.
+- Performs request validation.
+- Returns transaction identifiers and status.
+- Keeps the API ingestion process separate from execution.
+
+### Transaction Ingestion Service
+
+- Checks idempotency keys.
+- Detects duplicate submissions.
+- Rejects conflicting payloads.
+- Persists accepted transactions.
+
+### Transaction Inbox
+
+Acts as the durable processing queue.
+
+It maintains transaction state, retry information and processing eligibility.
+
+### Background Worker
+
+- Polls pending transactions.
+- Invokes transaction processing.
+- Handles retry scheduling.
+- Records terminal failures.
+
+### Transaction Processing Service
+
+- Validates transaction ordering.
+- Acquires appropriate database locks.
+- Checks account balance.
+- Updates account balance.
+- Creates ledger entries.
+- Marks transactions completed.
+
+All business database updates are committed atomically.
+
+# 5. Transaction State Model
+
+The following states describe the expected lifecycle.
+
+| State | Meaning |
+|---|---|
+| RECEIVED | Request accepted |
+| PENDING | Waiting for background processing |
+| PROCESSING | Currently being processed |
+| PROCESSED | Successfully completed |
+| DUPLICATE | Duplicate request identified |
+| RETRY_PENDING | Waiting for another attempt |
+| FAILED | Permanent business failure |
+| DEAD | Retry limit exceeded |
+
+The implementation may combine some states internally. The API should expose a consistent business status model.
+
+# 6. Idempotency Strategy
+
+Idempotency is the most important business guarantee.
+
+Each logical transaction has a unique transaction ID and each client submission has an idempotency key.
+
+Expected behavior:
+
+| Request | Expected behavior |
+|---|---|
+| Same key and same payload | Return existing transaction |
+| Same key and different payload | HTTP 409 Conflict |
+| Same transaction ID with another key | Reject as duplicate business transaction |
+| Previously completed transaction | Never apply again |
+| Concurrent duplicate submissions | Database uniqueness protects against duplicate acceptance |
+
+Database constraints are essential because application-level existence checks are vulnerable to race conditions.
+
+The database should enforce uniqueness for:
+
+- Transaction ID.
+- Idempotency key.
+- Ledger transaction reference.
+- Reversal reference, when applicable.
+
+## Idempotency guarantee
+
+The service does not guarantee that processing code executes only once.
+
+A worker may execute more than one attempt.
+
+Instead, the system ensures that repeated attempts do not create duplicate committed financial effects.
+
+This is achieved through database transactions, unique constraints, locking and transaction-state validation.
+
+# 7. Transaction Ordering Strategy
+
+Transactions are processed according to account sequence numbers rather than arrival time.
+
+Example:
+
+| Arrival order | Sequence | Operation | Amount |
+|---|---:|---|---:|
+| 1 | 3 | DEBIT | ₹200 |
+| 2 | 1 | CREDIT | ₹5,000 |
+| 3 | 2 | DEBIT | ₹1,000 |
+
+Expected processing order:
+
+1 → 2 → 3
+
+Sequence 3 must remain pending until sequence 2 is processed.
+
+If an earlier sequence never arrives, the system should identify and report the sequence gap rather than silently processing later transactions.
+
+For production, I would introduce a configurable gap timeout and reconciliation process.
+
+# 8. Consistency and Concurrency
+
+Consider an account with ₹10,000.
+
+Two debit requests arrive simultaneously:
+
+- Transaction A: ₹7,000.
+- Transaction B: ₹6,000.
+
+Both transactions cannot succeed.
+
+The processing service must serialize conflicting account updates using database locking or an equivalent concurrency-control strategy.
+
+Expected result:
+
+- One transaction succeeds.
+- One transaction fails due to insufficient balance.
+- Account balance never becomes negative.
+- Exactly one ledger entry is created for the successful debit.
+
+The database is the final authority for financial consistency.
+
+Optimistic versioning can detect concurrent updates, while pessimistic locking can serialize account updates where contention requires it.
+
+# 9. Atomic Transaction Processing
+
+The following operations must be performed within one database transaction:
+
+1. Lock and validate the inbox transaction.
+2. Validate transaction ordering.
+3. Lock and validate the account.
+4. Apply the balance update.
+5. Insert the ledger entry.
+6. Mark the inbox transaction as processed.
+
+If an operation fails, all changes must roll back.
+
+This prevents partial financial updates.
+
+# 10. Failure Handling and Recovery
+
+| Failure | Recovery |
+|---|---|
+| Duplicate request | Return existing transaction |
+| Conflicting idempotency payload | Reject with HTTP 409 |
+| Worker crash before commit | Database rollback; retry later |
+| Temporary database failure | Retry with backoff |
+| Insufficient funds | Permanent business failure |
+| Missing sequence | Defer processing |
+| Retry limit reached | Mark DEAD |
+| Duplicate ledger insertion | Database uniqueness constraint |
+| Application restart | Resume eligible inbox records |
+
+## Retry policy
+
+Use exponential backoff.
+
+Example:
+
+```text
+Attempt 1: 1 second
+Attempt 2: 2 seconds
+Attempt 3: 4 seconds
+Attempt 4: 8 seconds
+```
+
+Production implementations should include jitter to prevent simultaneous retry spikes.
+
+Permanent business failures should not be retried as technical failures.
+
+# 11. API Design
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| POST | /api/transactions | Submit transaction |
+| GET | /api/transactions/{id} | Get transaction status |
+| GET | /api/transactions | List transactions |
+| GET | /api/accounts/{id} | Get account details |
+| GET | /actuator/health | Health check |
+| GET | /api/transactions/summary | Recommended operational summary endpoint |
+
+Example request:
+
+```json
+{
+  "transactionId": "TXN-10001",
+  "idempotencyKey": "PAYMENT-10001",
+  "accountId": 1001,
+  "sequenceNumber": 1,
+  "type": "DEBIT",
+  "amount": 500.00,
+  "currency": "INR",
+  "description": "Utility payment"
+}
+```
+
+# 12. Observability
+
+A production service must make transaction processing visible.
+
+Recommended processing events:
+
+```text
+TRANSACTION_RECEIVED
+TRANSACTION_DUPLICATE
+TRANSACTION_PROCESSING_STARTED
+TRANSACTION_PROCESSED
+TRANSACTION_RETRY_SCHEDULED
+TRANSACTION_FAILED
+TRANSACTION_DEAD
+```
+
+Recommended log attributes:
+
+- Transaction ID.
+- Correlation ID.
+- Account reference.
+- Processing status.
+- Retry count.
+- Processing duration.
+- Failure category.
+
+Sensitive customer information, credentials and payment details should not be logged.
+
+## Operational summary
+
+The service should expose metrics for:
+
+- Total received transactions.
+- Successfully processed transactions.
+- Duplicate requests.
+- Pending transactions.
+- Retry attempts.
+- Failed transactions.
+- Dead transactions.
+- Average processing duration.
+
+# 13. Security and Validation
+
+Recommended controls:
+
+- Validate transaction amount and currency.
+- Validate account existence.
+- Reject malformed requests.
+- Apply authentication and authorization.
+- Avoid hardcoded credentials.
+- Avoid logging sensitive customer information.
+- Return safe and meaningful error responses.
+- Maintain an audit trail for financial changes.
+
+# 14. Testing Strategy
+
+The most important tests are business and failure scenarios.
+
+| Test | Expected result |
+|---|---|
+| Successful credit | Balance increases once |
+| Successful debit | Balance decreases once |
+| Duplicate request | No duplicate balance update |
+| Same key, different payload | HTTP 409 |
+| Duplicate transaction ID | Rejected |
+| Out-of-order request | Deferred |
+| Insufficient balance | Debit rejected |
+| Concurrent debit | No negative balance |
+| Database rollback | No partial ledger or balance update |
+| Temporary failure | Retry scheduled |
+| Retry exhaustion | DEAD state |
+| Duplicate reversal | Original transaction reversed once |
+
+Integration testing against PostgreSQL and multi-worker concurrency testing are recommended before production deployment.
+
+# 15. AI-Assisted Development Approach
+
+GitHub Copilot can accelerate development, but generated code must be reviewed.
+
+My approach:
+
+1. Use Copilot to generate an initial architecture and project structure.
+2. Review entity relationships and database constraints.
+3. Generate service implementation and API validation.
+4. Independently review transaction boundaries and concurrency behavior.
+5. Generate unit and integration tests.
+6. Verify the tests against business acceptance criteria.
+7. Review failure scenarios and document limitations.
+
+AI-generated code is treated as a proposal, not as an automatically trusted implementation.
+
+# 16. Production Readiness and Scalability
+
+The current assessment implementation uses a lightweight database and scheduled worker.
+
+For production, I would consider:
+
+| Area | Production enhancement |
+|---|---|
+| Database | PostgreSQL with Flyway |
+| Worker coordination | Atomic claiming using SKIP LOCKED or leases |
+| Messaging | Kafka or AWS SQS where appropriate |
+| Observability | Micrometer, dashboards and distributed tracing |
+| Security | OAuth2/JWT and role-based access |
+| Resilience | Exponential backoff with jitter |
+| External effects | Transactional outbox |
+| Recovery | Operational replay and reconciliation |
+| Testing | Testcontainers and concurrency tests |
+
+For multi-instance deployments, atomic worker claiming and lease recovery are particularly important.
+
+For external payment or notification services, use an outbox and downstream idempotency. A local database transaction cannot atomically commit an external service operation.
+
+# 17. FDE Ownership and Customer Impact
+
+The design prioritizes customer safety.
+
+A duplicate debit is not simply a technical defect; it directly impacts customer trust and creates financial and operational reconciliation work.
+
+Therefore, the solution prioritizes:
+
+1. Preventing duplicate financial effects.
+2. Maintaining consistent account balances.
+3. Recovering safely after failures.
+4. Making failed transactions visible.
+5. Providing traceability and operational recovery.
+6. Communicating implementation limitations honestly.
+
+The implementation deliberately focuses on these core guarantees rather than introducing unnecessary infrastructure.
+
+# 18. Conclusion
+
+This project demonstrates an engineering approach to reliable asynchronous transaction processing.
+
+The core design combines durable request persistence, idempotency, ordering validation, database consistency, concurrency control and retry mechanisms.
+
+The central principle is:
+
+**Assume every request can be duplicated, every worker can fail, every network call can time out and every dependency can temporarily become unavailable. Design the system to recover without creating duplicate business effects.**
+
+This is the foundation of a reliable enterprise transaction-processing service and a customer-oriented Forward Deployed Engineering solution.
