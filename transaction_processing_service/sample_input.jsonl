@@ -1,0 +1,6 @@
+{"transactionId":"TXN-2002","requestId":"REQ-2","sequence":2,"accountId":"ACC-201","type":"DEBIT","amount":40}
+{"transactionId":"TXN-2001","requestId":"REQ-1","sequence":1,"accountId":"ACC-201","type":"CREDIT","amount":100}
+{"transactionId":"TXN-2002","requestId":"REQ-2-DUP","sequence":2,"accountId":"ACC-201","type":"DEBIT","amount":40}
+{"transactionId":"TXN-2003","requestId":"REQ-3","sequence":3,"accountId":"ACC-201","type":"CREDIT","amount":25}
+{"transactionId":"TXN-2004","requestId":"REQ-4","sequence":4,"accountId":"ACC-202","type":"DEBIT","amount":-10}
+{"transactionId":"TXN-2005","requestId":"REQ-5","sequence":5,"accountId":"ACC-203","type":"CREDIT","amount":500}
